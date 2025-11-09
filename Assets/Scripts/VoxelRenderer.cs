@@ -37,10 +37,6 @@ public static class VoxelRenderer
             }
         }
 
-        if (centerPosition.HasValue)
-        {
-            Debug.Log($"[Voxel] Center voxel at ({centerPosition.Value.x:F2}, {centerPosition.Value.y:F2}, {centerPosition.Value.z:F2})");
-        }
     }
 
     public static void RenderAxisTest(Vector3 anchor)
@@ -59,7 +55,6 @@ public static class VoxelRenderer
         {
             var position = anchor + offset + Vector3.up * 0.1f;
             VoxelRendererManager.Instance.RenderCube(position, 0.03f, color);
-            Debug.Log($"[Voxel] Axis test {name} at {position}");
         }
     }
 
@@ -67,6 +62,33 @@ public static class VoxelRenderer
     {
         VoxelRendererManager.Instance.ClearAll();
     }
+
+    public static void ApplyFrame(IEnumerable<VoxelData> voxels, bool useTemporalBlend, float blendFactor)
+    {
+        VoxelRendererManager.Instance.ApplyFrame(voxels, useTemporalBlend, blendFactor);
+    }
+
+    public static void RenderText(Vector3 position, string message, Color color)
+    {
+        VoxelRendererManager.Instance.RenderTextBillboard(position, message, color);
+    }
+}
+
+public struct VoxelData
+{
+    public Vector3 Position;
+    public float Size;
+    public Color Color;
+    public bool UseBillboard;
+    public float BillboardScale;
+    public Texture2D BillboardTexture;
+}
+
+internal enum VoxelPooledType
+{
+    Cube,
+    Billboard,
+    Text
 }
 
 internal sealed class VoxelRendererManager : MonoBehaviour
@@ -86,46 +108,169 @@ internal sealed class VoxelRendererManager : MonoBehaviour
         }
     }
 
-    private readonly List<GameObject> _pool = new List<GameObject>();
-    private readonly List<GameObject> _active = new List<GameObject>();
+    private readonly Dictionary<VoxelPooledType, Stack<GameObject>> _pools = new Dictionary<VoxelPooledType, Stack<GameObject>>();
+    private readonly List<GameObject> _activeObjects = new List<GameObject>();
+    private readonly List<VoxelData> _previousData = new List<VoxelData>();
+    private readonly List<VoxelData> _currentData = new List<VoxelData>();
 
     public void RenderCube(Vector3 position, float size, Color color)
     {
-        var cube = GetCube();
+        var cube = GetObject(VoxelPooledType.Cube);
         cube.transform.position = position;
         cube.transform.localScale = Vector3.one * size;
-        var renderer = cube.GetComponent<MeshRenderer>();
-        renderer.sharedMaterial.color = color;
-        cube.SetActive(true);
-        _active.Add(cube);
+        cube.GetComponent<MeshRenderer>().sharedMaterial.color = color == default ? Color.red : color;
+        _activeObjects.Add(cube);
     }
 
     public void ClearAll()
     {
-        foreach (var cube in _active)
-        {
-            cube.SetActive(false);
-            _pool.Add(cube);
-        }
-        _active.Clear();
+        RecycleActiveObjects();
+        _previousData.Clear();
     }
 
-    private GameObject GetCube()
+    private GameObject GetObject(VoxelPooledType type)
     {
-        if (_pool.Count > 0)
+        if (!_pools.TryGetValue(type, out var pool))
         {
-            var cube = _pool[_pool.Count - 1];
-            _pool.RemoveAt(_pool.Count - 1);
-            return cube;
+            pool = new Stack<GameObject>();
+            _pools[type] = pool;
         }
 
-        var go = GameObject.CreatePrimitive(PrimitiveType.Cube);
-        Object.Destroy(go.GetComponent<Collider>());
-        var renderer = go.GetComponent<MeshRenderer>();
-        Shader shader = Shader.Find("Unlit/Color") ?? Shader.Find("Unlit/Texture") ?? Shader.Find("Standard");
-        var material = new Material(shader);
-        renderer.sharedMaterial = material;
-        go.transform.SetParent(transform);
-        return go;
+        if (pool.Count > 0)
+        {
+            var obj = pool.Pop();
+            obj.SetActive(true);
+            return obj;
+        }
+
+        GameObject created;
+        switch (type)
+        {
+            case VoxelPooledType.Billboard:
+                created = GameObject.CreatePrimitive(PrimitiveType.Quad);
+                Object.Destroy(created.GetComponent<Collider>());
+                break;
+            case VoxelPooledType.Text:
+                created = new GameObject("VoxelText");
+                var textMesh = created.AddComponent<TextMesh>();
+                textMesh.text = string.Empty;
+                textMesh.alignment = TextAlignment.Center;
+                textMesh.anchor = TextAnchor.MiddleCenter;
+                textMesh.fontSize = 64;
+                textMesh.color = Color.white;
+                created.AddComponent<MeshRenderer>();
+                break;
+            default:
+                created = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                Object.Destroy(created.GetComponent<Collider>());
+                break;
+        }
+
+        created.AddComponent<VoxelPooledMarker>().Type = type;
+        created.transform.SetParent(transform);
+        return created;
     }
+
+    public void ApplyFrame(IEnumerable<VoxelData> voxels, bool useTemporalBlend, float blendFactor)
+    {
+        RecycleActiveObjects();
+
+        _currentData.Clear();
+        _currentData.AddRange(voxels);
+        bool canBlend = useTemporalBlend && blendFactor > 0f && blendFactor < 1f && _previousData.Count == _currentData.Count && _previousData.Count > 0;
+
+        for (int i = 0; i < _currentData.Count; i++)
+        {
+            var data = _currentData[i];
+            if (canBlend)
+            {
+                var prev = _previousData[i];
+                data.Position = Vector3.Lerp(prev.Position, data.Position, blendFactor);
+                data.Size = Mathf.Lerp(prev.Size, data.Size, blendFactor);
+            }
+
+            if (data.UseBillboard)
+            {
+                RenderBillboard(data.Position, data.BillboardScale, data.Color, data.BillboardTexture);
+            }
+            else
+            {
+                RenderCube(data.Position, data.Size, data.Color);
+            }
+
+            _currentData[i] = data;
+        }
+
+        _previousData.Clear();
+        _previousData.AddRange(_currentData);
+    }
+
+    private void RenderBillboard(Vector3 position, float scale, Color color, Texture2D texture)
+    {
+        var quad = GetObject(VoxelPooledType.Billboard);
+        quad.transform.position = position;
+        quad.transform.localScale = Vector3.one * scale;
+        var cam = Camera.main;
+        if (cam != null)
+        {
+            quad.transform.LookAt(cam.transform);
+            quad.transform.Rotate(0f, 180f, 0f);
+        }
+        var renderer = quad.GetComponent<MeshRenderer>();
+        Shader shader = Shader.Find("Unlit/Texture") ?? Shader.Find("Unlit/Color");
+        var material = new Material(shader);
+        if (texture != null && material.HasProperty("_MainTex"))
+        {
+            material.SetTexture("_MainTex", texture);
+            material.SetColor("_Color", color);
+        }
+        else
+        {
+            material.color = color;
+        }
+        renderer.sharedMaterial = material;
+        _activeObjects.Add(quad);
+    }
+
+    public void RenderTextBillboard(Vector3 position, string message, Color color)
+    {
+        var textObj = GetObject(VoxelPooledType.Text);
+        var textMesh = textObj.GetComponent<TextMesh>();
+        textMesh.text = message;
+        textMesh.color = color;
+        textMesh.alignment = TextAlignment.Center;
+        textMesh.anchor = TextAnchor.MiddleCenter;
+        textMesh.characterSize = 0.1f;
+        textMesh.fontSize = 64;
+        textObj.transform.position = position;
+        textObj.transform.localScale = Vector3.one * 0.05f;
+        var cam = Camera.main;
+        if (cam != null)
+        {
+            textObj.transform.LookAt(cam.transform);
+            textObj.transform.Rotate(0f, 180f, 0f);
+        }
+        _activeObjects.Add(textObj);
+    }
+
+    private void RecycleActiveObjects()
+    {
+        foreach (var obj in _activeObjects)
+        {
+            obj.SetActive(false);
+            var marker = obj.GetComponent<VoxelPooledMarker>();
+            if (!_pools.TryGetValue(marker.Type, out var stack))
+            {
+                stack = new Stack<GameObject>();
+                _pools[marker.Type] = stack;
+            }
+            stack.Push(obj);
+        }
+        _activeObjects.Clear();
+    }
+}
+
+internal class VoxelPooledMarker : MonoBehaviour
+{
+    public VoxelPooledType Type;
 }

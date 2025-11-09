@@ -12,7 +12,16 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 16b4e7ed8f69e4f1a972a4946046672e, type: 3}
   m_Name: VoxelRenderSettings
   m_EditorClassIdentifier: Assembly-CSharp::VoxelRenderSettings
-  condensedView: 1
-  condensedSpacing: 0.01
+  condensedView: 0
+  showTestGrid: 0
+  condensedSpacing: 0.005
   condensedHeightScale: 0.002
-  condensedVoxelSize: 0.01
+  condensedVoxelSize: 0.02
+  enableTemporalBlend: 1
+  blendFactor: 0.688
+  renderingMode: 1
+  blurMaskBeforeRender: 1
+  billboardTexture: {fileID: 0}
+  billboardScale: 0.2
+  renderMatrixUpscale: 1
+  depthScale: 0.1

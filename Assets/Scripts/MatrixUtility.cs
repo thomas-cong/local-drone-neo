@@ -1,4 +1,5 @@
 using System;
+using UnityEngine;
 
 public static class MatrixUtility
 {
@@ -10,7 +11,7 @@ public static class MatrixUtility
             throw new ArgumentOutOfRangeException(nameof(standardDeviation), "Standard deviation must be non-negative.");
         }
 
-        var random = seed.HasValue ? new Random(seed.Value) : RandomInstance.Instance;
+        var random = seed.HasValue ? new System.Random(seed.Value) : RandomInstance.Instance;
         int rows = matrix.GetLength(0);
         int cols = matrix.GetLength(1);
 
@@ -78,6 +79,116 @@ public static class MatrixUtility
         }
     }
 
+    public static void BoxBlurInPlace(float[,] matrix, int kernelRadius)
+    {
+        ValidateMatrix(matrix);
+        if (kernelRadius <= 0)
+        {
+            return;
+        }
+
+        int rows = matrix.GetLength(0);
+        int cols = matrix.GetLength(1);
+        var temp = new float[rows, cols];
+
+        for (int r = 0; r < rows; r++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                float sum = 0f;
+                int count = 0;
+                for (int dr = -kernelRadius; dr <= kernelRadius; dr++)
+                {
+                    int rr = r + dr;
+                    if (rr < 0 || rr >= rows)
+                    {
+                        continue;
+                    }
+
+                    for (int dc = -kernelRadius; dc <= kernelRadius; dc++)
+                    {
+                        int cc = c + dc;
+                        if (cc < 0 || cc >= cols)
+                        {
+                            continue;
+                        }
+
+                        sum += matrix[rr, cc];
+                        count++;
+                    }
+                }
+
+                temp[r, c] = count > 0 ? sum / count : matrix[r, c];
+            }
+        }
+
+        Array.Copy(temp, matrix, rows * cols);
+    }
+
+    public static float[,] UpscaleMatrix(float[,] source, int scale)
+    {
+        ValidateMatrix(source);
+        if (scale <= 1)
+        {
+            return source;
+        }
+
+        int rows = source.GetLength(0);
+        int cols = source.GetLength(1);
+        int newRows = rows * scale;
+        int newCols = cols * scale;
+        var result = new float[newRows, newCols];
+
+        for (int r = 0; r < newRows; r++)
+        {
+            float srcRow = (float)r / scale;
+            int r0 = Mathf.Clamp((int)Math.Floor(srcRow), 0, rows - 1);
+            int r1 = Mathf.Clamp(r0 + 1, 0, rows - 1);
+            float tRow = srcRow - r0;
+
+            for (int c = 0; c < newCols; c++)
+            {
+                float srcCol = (float)c / scale;
+                int c0 = Mathf.Clamp((int)Math.Floor(srcCol), 0, cols - 1);
+                int c1 = Mathf.Clamp(c0 + 1, 0, cols - 1);
+                float tCol = srcCol - c0;
+
+                float top = Mathf.Lerp(source[r0, c0], source[r0, c1], tCol);
+                float bottom = Mathf.Lerp(source[r1, c0], source[r1, c1], tCol);
+                result[r, c] = Mathf.Lerp(top, bottom, tRow);
+            }
+        }
+
+        return result;
+    }
+
+    public static int[,] UpscaleMask(int[,] source, int scale)
+    {
+        ValidateMask(source, source.GetLength(0), source.GetLength(1));
+        if (scale <= 1)
+        {
+            return source;
+        }
+
+        int rows = source.GetLength(0);
+        int cols = source.GetLength(1);
+        int newRows = rows * scale;
+        int newCols = cols * scale;
+        var result = new int[newRows, newCols];
+
+        for (int r = 0; r < newRows; r++)
+        {
+            int srcRow = Mathf.Clamp(r / scale, 0, rows - 1);
+            for (int c = 0; c < newCols; c++)
+            {
+                int srcCol = Mathf.Clamp(c / scale, 0, cols - 1);
+                result[r, c] = source[srcRow, srcCol];
+            }
+        }
+
+        return result;
+    }
+
     private static void ValidateMatrix(float[,] matrix)
     {
         if (matrix == null)
@@ -99,7 +210,7 @@ public static class MatrixUtility
         }
     }
 
-    private static float SampleGaussian(Random random, float mean, float standardDeviation)
+    private static float SampleGaussian(System.Random random, float mean, float standardDeviation)
     {
         // Box-Muller transform
         double u1 = 1.0 - random.NextDouble();
@@ -110,6 +221,6 @@ public static class MatrixUtility
 
     private static class RandomInstance
     {
-        internal static readonly Random Instance = new Random();
+        internal static readonly System.Random Instance = new System.Random();
     }
 }
