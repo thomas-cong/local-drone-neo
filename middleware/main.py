@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime
@@ -11,6 +12,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from helpers.ffmpeg_bridge import FFmpegHLSBridge
+
+try:
+    import paho.mqtt.client as mqtt
+except ImportError:  # pragma: no cover
+    mqtt = None
 logger = logging.getLogger("middleware")
 logging.basicConfig(level=logging.INFO)
 
@@ -21,6 +27,15 @@ QUEST_HLS_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_PLAYLIST_NAME = "index.m3u8"
 # DEFAULT_RTSP_URL = os.getenv("JETSON_RTSP_URL")
 DEFAULT_RTSP_URL = "rtsp://10.103.1.3:8554/cam"
+
+MQTT_ENABLED = os.environ.get("MQTT_ENABLE", "1") != "0"
+MQTT_HOST = os.environ.get("MQTT_HOST", "10.103.1.3")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+# MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "fastsam/masks")
+# MQTT_CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", "fastsam-subscriber")
+DEFAULT_MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "depth/seg")
+DEFAULT_MQTT_CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", "depth-seg-subscriber")
+MQTT_QOS = int(os.environ.get("MQTT_QOS", "0"))
 
 app = FastAPI(
     title="Local Drone Middleware",
@@ -35,6 +50,12 @@ app.mount("/hls", StaticFiles(directory=HLS_ROOT_DIR, html=False), name="hls")
 
 bridge_lock = asyncio.Lock()
 bridge: Optional[FFmpegHLSBridge] = None
+
+mqtt_lock = asyncio.Lock()
+mqtt_client: Optional["mqtt.Client"] = None  # type: ignore[misc]
+mqtt_connection_params: Optional[tuple[str, int]] = None
+subscribed_topics: set[str] = set()
+mqtt_message_count = 0
 
 
 class SerialFrame(BaseModel):
@@ -107,6 +128,16 @@ class StreamStatus(BaseModel):
     manifest_url: Optional[str] = None
     playlist_path: Optional[str] = None
     message: Optional[str] = None
+
+
+class MQTTSubscribeRequest(BaseModel):
+    """Configures a subscription to the Jetson-published MQTT topic."""
+
+    host: Optional[str] = None
+    port: Optional[int] = None
+    topic: Optional[str] = None
+    qos: Optional[int] = None
+    client_id: Optional[str] = None
 
 
 async def persist_serial_payload(packet: SerialFrame) -> None:
@@ -289,6 +320,125 @@ async def quest_stream_status(request: Request) -> StreamStatus:
         manifest_url=manifest,
         playlist_path=playlist,
     )
+
+
+def _ensure_mqtt_client(
+    host: str, port: int, client_id: str
+) -> "mqtt.Client":  # type: ignore[name-defined]
+    """Initializes and caches the MQTT client instance."""
+    if mqtt is None:
+        raise HTTPException(
+            status_code=500,
+            detail="paho-mqtt is not installed. Install it to enable MQTT subscriptions.",
+        )
+
+    global mqtt_client, mqtt_connection_params
+
+    if mqtt_client is None:
+        logger.info(
+            "Initializing MQTT client",
+            extra={"host": host, "port": port, "client_id": client_id},
+        )
+
+        client = mqtt.Client(client_id=client_id)
+
+        def _on_connect(client, userdata, flags, rc):  # pragma: no cover - callback
+            if rc == 0:
+                logger.info("Connected to MQTT broker at %s:%s", host, port)
+            else:
+                logger.error(
+                    "Failed to connect to MQTT broker at %s:%s (code %s)",
+                    host,
+                    port,
+                    rc,
+                )
+
+        def _on_message(client, userdata, msg):  # pragma: no cover - callback
+            global mqtt_message_count
+            mqtt_message_count += 1
+            data: Optional[dict] = None
+            try:
+                payload_text = msg.payload.decode("utf-8")
+                parsed = json.loads(payload_text)
+                if isinstance(parsed, dict):
+                    data = parsed
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                data = None
+
+            # logger.info("MQTT %s => %s", msg.topic, payload)  # noisy payload logging
+            # print(f"MQTT message #{mqtt_message_count} ({msg.topic}) keys: {keys}")  # noqa: ERA001
+            if data and "object_detections" in data:
+                print(
+                    f"MQTT message #{mqtt_message_count} ({msg.topic}) "
+                    f"object_detections: {data['object_detections']}"
+                )
+
+        client.on_connect = _on_connect
+        client.on_message = _on_message
+
+        try:
+            client.connect(host, port, keepalive=60)
+        except Exception as exc:  # pragma: no cover
+            logger.exception("MQTT connection error")
+            raise HTTPException(
+                status_code=502, detail=f"MQTT connection error: {exc}"
+            ) from exc
+
+        client.loop_start()
+
+        mqtt_client = client
+        mqtt_connection_params = (host, port)
+
+    else:
+        current_host, current_port = mqtt_connection_params or (host, port)
+        if (host, port) != (current_host, current_port):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "MQTT client already connected to "
+                    f"{current_host}:{current_port}. Restart the server to change broker."
+                ),
+            )
+
+    return mqtt_client
+
+
+@app.post("/mqtt/subscribe")
+async def subscribe_mqtt(
+    payload: MQTTSubscribeRequest, background_tasks: BackgroundTasks
+) -> dict[str, object]:
+    """Subscribes to the configured MQTT topic and logs incoming messages."""
+    if not MQTT_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="MQTT subscriptions are disabled. Set MQTT_ENABLE=1 to enable.",
+        )
+
+    host = payload.host or MQTT_HOST
+    port = payload.port or MQTT_PORT
+    topic = payload.topic or MQTT_TOPIC
+    qos = payload.qos if payload.qos is not None else MQTT_QOS
+    client_id = payload.client_id or MQTT_CLIENT_ID
+
+    async with mqtt_lock:
+        client = _ensure_mqtt_client(host, port, client_id)
+
+        if topic in subscribed_topics:
+            logger.info("Already subscribed to MQTT topic %s", topic)
+            return {"status": "exists", "topic": topic, "host": host, "port": port}
+
+        subscribed_topics.add(topic)
+
+        def _subscribe():
+            logger.info("Subscribing to MQTT topic %s (QoS %s)", topic, qos)
+            result, _ = client.subscribe(topic, qos=qos)
+            if result != mqtt.MQTT_ERR_SUCCESS:  # pragma: no cover - network error
+                logger.error("MQTT subscribe failed for %s (code %s)", topic, result)
+                subscribed_topics.discard(topic)
+
+        background_tasks.add_task(_subscribe)
+
+    return {"status": "subscribing", "topic": topic, "host": host, "port": port}
 
 
 @app.post("/quest/hls/session", response_model=QuestStreamDescriptor)
