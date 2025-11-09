@@ -51,7 +51,7 @@ class StreamingDepthSegmentation:
                  mqtt_topic=None, mqtt_client_id=None, mqtt_qos=None,
                  enable_object_detection=True, object_detect_every_n=5,
                  object_model_size='n', object_threshold=0.5, object_overlap_threshold=0.6,
-                 save_json_file=None):
+                 save_json_file=None, camera_fps_limit=None):
         """
         Initialize streaming processor
         
@@ -80,6 +80,7 @@ class StreamingDepthSegmentation:
             object_threshold: YOLO confidence threshold (default: 0.5)
             object_overlap_threshold: Minimum overlap ratio to include segment (default: 0.6)
             save_json_file: Path to save JSON payloads to file (default: None, disabled)
+            camera_fps_limit: Limit camera input to target FPS (e.g., 15), None = no limit
         """
         self.process_resolution = process_resolution
         self.process_every_n = process_every_n
@@ -87,6 +88,9 @@ class StreamingDepthSegmentation:
         self.reinit_every = reinit_every
         self.min_coverage = min_coverage
         self.max_coverage = max_coverage
+        self.camera_fps_limit = camera_fps_limit
+        self.min_frame_interval = 1.0 / camera_fps_limit if camera_fps_limit else 0
+        self.last_frame_time = 0
         
         print("Loading models for real-time streaming...")
         
@@ -339,24 +343,48 @@ class StreamingDepthSegmentation:
         self.last_depth_map = depth_map
         
         # Create prompts from YOLO detections if object detection is enabled
+        yolo_prompts_used = False
+        run_auto_prompt = False
         if self.enable_object_detection and detections is not None and frame_shape is not None:
-            self.prompts = self._convert_detections_to_prompts(
+            yolo_prompts = self._convert_detections_to_prompts(
                 detections, frame_shape, frame.shape
             )
-            if not self.initialized and self.prompts:
-                print(f"Using {len(self.prompts)} YOLO detections as segmentation prompts")
-                self.initialized = True
-        else:
-            # Fallback to auto-detection if object detection is disabled
-            if not self.initialized or (self.reinit_every > 0 and 
-                                        self.frame_idx % (self.reinit_every * self.process_every_n) == 0):
+            if yolo_prompts:
+                self.prompts = yolo_prompts
+                yolo_prompts_used = True
                 if not self.initialized:
-                    print("Initializing object detection...")
-                self.prompts = self.tracker.find_objects(depth_colored, 
-                                                                  max_objects=self.max_objects,
-                                                                  min_coverage=self.min_coverage,
-                                                                  max_coverage=self.max_coverage)
+                    print(f"Using {len(self.prompts)} YOLO detections as segmentation prompts")
                 self.initialized = True
+            else:
+                self.prompts = []
+                run_auto_prompt = True
+        else:
+            self.prompts = [] if not self.initialized else self.prompts
+            run_auto_prompt = True
+
+        if run_auto_prompt:
+            need_new_prompts = (
+                not self.initialized
+                or not self.prompts
+                or (
+                    self.reinit_every > 0 and
+                    self.frame_idx % (self.reinit_every * self.process_every_n) == 0
+                )
+            )
+            if need_new_prompts:
+                if not yolo_prompts_used:
+                    print("[DepthSeg] Falling back to automatic segmentation prompts")
+                auto_prompts = self.tracker.find_objects(
+                    depth_colored,
+                    max_objects=self.max_objects,
+                    min_coverage=self.min_coverage,
+                    max_coverage=self.max_coverage
+                )
+                self.prompts = auto_prompts
+                if auto_prompts:
+                    if not yolo_prompts_used and not self.initialized:
+                        print("Using automatic segmentation prompts")
+                    self.initialized = True
         
         # Segment using single-frame prediction
         masks = None
@@ -609,6 +637,15 @@ class StreamingDepthSegmentation:
         Returns:
             Processed frame with depth + segmentation overlay
         """
+        # Apply frame rate limiting if needed
+        if self.camera_fps_limit:
+            current_time = time.time()
+            elapsed = current_time - self.last_frame_time
+            if elapsed < self.min_frame_interval:
+                # Skip this frame to maintain target FPS
+                return None
+            self.last_frame_time = current_time
+        
         original_shape = frame.shape
         
         # Store raw frame for object detection
@@ -639,15 +676,18 @@ class StreamingDepthSegmentation:
                 self.last_object_mappings = {}
                 for obj_id, prompt in enumerate(self.prompts):
                     if obj_id in self.last_masks:
-                        self.last_object_mappings[obj_id] = {
-                            'overlap': 1.0,  # 100% by design since we used bbox as prompt
-                            'detection': {
-                                'class_name': prompt['class_name'],
-                                'class_id': prompt['class_id'],
-                                'confidence': prompt['confidence'],
-                                'bbox': prompt['bbox']
+                        if isinstance(prompt, dict) and all(
+                            key in prompt for key in ('class_name', 'class_id', 'confidence', 'bbox')
+                        ):
+                            self.last_object_mappings[obj_id] = {
+                                'overlap': 1.0,  # 100% by design since we used bbox as prompt
+                                'detection': {
+                                    'class_name': prompt['class_name'],
+                                    'class_id': prompt['class_id'],
+                                    'confidence': prompt['confidence'],
+                                    'bbox': prompt['bbox']
+                                }
                             }
-                        }
             else:
                 self.last_filtered_masks = self.last_masks
                 self.last_object_mappings = {}
@@ -680,8 +720,11 @@ class StreamingDepthSegmentation:
         if self.frame_buffer is not None:
             self.frame_buffer.append((self.frame_idx, output_full.copy()))
         
-        # No overlay - just return the masked depth frame
+        # Log FPS every 30 frames
         self.frame_idx += 1
+        if self.frame_idx % 30 == 0:
+            avg_fps = np.mean(self.fps_tracker) if len(self.fps_tracker) > 0 else 0
+            print(f"[DepthSeg] Processed {self.frame_idx} frames | FPS: {avg_fps:.1f}")
         return output_full
     
     def _open_capture(self, source, api_preference=cv2.CAP_ANY):
@@ -739,9 +782,13 @@ class StreamingDepthSegmentation:
                 # Process frame
                 output = self.process_frame(frame)
                 
-                # Display
-                if display:
+                # Display (skip if frame was dropped for FPS limiting)
+                if output is not None and display:
                     cv2.imshow('Depth + Segmentation Stream', output)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                elif display:
+                    # Still need to process key events even when frame is skipped
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
         
@@ -805,8 +852,13 @@ class StreamingDepthSegmentation:
                     
                     output = self.process_frame(frame)
                     
-                    if display:
+                    # Display (skip if frame was dropped for FPS limiting)
+                    if output is not None and display:
                         cv2.imshow('Depth + Segmentation Stream', output)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            raise KeyboardInterrupt
+                    elif display:
+                        # Still need to process key events even when frame is skipped
                         if cv2.waitKey(1) & 0xFF == ord('q'):
                             raise KeyboardInterrupt
             except KeyboardInterrupt:
@@ -993,12 +1045,14 @@ def main():
                        help='Run object detection every N frames (default: 5)')
     parser.add_argument('--object-model-size', type=str, default='n', choices=['n', 's', 'm', 'l', 'x'],
                        help='YOLO model size: n(ano), s(mall), m(edium), l(arge), x(large) (default: n)')
-    parser.add_argument('--object-threshold', type=float, default=0.5,
-                       help='YOLO confidence threshold (default: 0.5)')
+    parser.add_argument('--object-threshold', type=float, default=0.3,
+                       help='YOLO confidence threshold (default: 0.3)')
     parser.add_argument('--object-overlap-threshold', type=float, default=0.6,
                        help='Minimum overlap ratio to include segment (default: 0.6 = 60%%)')
     parser.add_argument('--save-json-file', type=str, default=None,
                        help='Save JSON payloads to file (default: None, disabled)')
+    parser.add_argument('--camera-fps-limit', type=float, default=None,
+                       help='Limit camera input to target FPS (e.g., 15 for 15 FPS, default: None = no limit)')
     parser.set_defaults(mqtt_enable=None)
     
     args = parser.parse_args()
@@ -1035,7 +1089,8 @@ def main():
         object_model_size=args.object_model_size,
         object_threshold=args.object_threshold,
         object_overlap_threshold=args.object_overlap_threshold,
-        save_json_file=args.save_json_file
+        save_json_file=args.save_json_file,
+        camera_fps_limit=args.camera_fps_limit
     )
     
     # Determine source type
