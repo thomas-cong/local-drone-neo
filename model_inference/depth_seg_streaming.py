@@ -9,12 +9,10 @@ os.environ['USE_TORCH'] = '1'
 os.environ['USE_TF'] = '0'
 
 import time
-import threading
 import cv2
 import numpy as np
 import torch
 import json
-import queue
 from collections import deque
 from tqdm import tqdm
 from depth_estimator import DepthEstimator
@@ -129,9 +127,6 @@ class StreamingDepthSegmentation:
         self.last_masks = None
         self.last_filtered_masks = None  # Masks filtered by object detection
         self.last_object_mappings = None  # Maps obj_id to detected bbox
-        self.last_masks_for_json = None
-        self.last_object_mappings_for_json = None
-        self.last_mask_signature = None
         self.prompts = None
         self.initialized = False
         
@@ -169,20 +164,9 @@ class StreamingDepthSegmentation:
         self.save_frames_dir = save_frames_dir
         self.frame_buffer = deque(maxlen=save_frames_on_exit) if save_frames_on_exit > 0 else None
         
-        # JSON publishing worker state
-        self.json_queue = queue.Queue()
-        self.json_worker_stop = threading.Event()
-        self.json_worker_thread = threading.Thread(
-            target=self._json_worker,
-            name="json-publisher",
-            daemon=True
-        )
-        self.json_worker_thread.start()
-        
         # Performance tracking
         self.fps_tracker = deque(maxlen=30)
         self.last_time = time.time()
-        self.last_perf_log_time = 0.0
         
         self._setup_mqtt()
 
@@ -515,45 +499,6 @@ class StreamingDepthSegmentation:
             self.mqtt_client = None
             self.mqtt_active = False
     
-    def _json_worker(self):
-        """Background worker to publish JSON payloads asynchronously."""
-        while True:
-            try:
-                item = self.json_queue.get(timeout=0.5)
-            except queue.Empty:
-                if self.json_worker_stop.is_set():
-                    break
-                continue
-            
-            if item is None:
-                self.json_queue.task_done()
-                break
-            
-            try:
-                self._publish_json(item)
-            except Exception as exc:
-                print(f"JSON publish failed (worker): {exc}")
-            finally:
-                self.json_queue.task_done()
-    
-    def _stop_json_worker(self):
-        """Stop the JSON worker thread after draining the queue."""
-        if not self.json_worker_thread:
-            return
-        
-        try:
-            self.json_queue.join()
-        except KeyboardInterrupt:
-            pass
-        
-        self.json_worker_stop.set()
-        self.json_queue.put(None)
-        self.json_worker_thread.join(timeout=5)
-        if self.json_worker_thread.is_alive():
-            print("Warning: JSON worker did not shut down cleanly.")
-        self.json_worker_thread = None
-        self.json_worker_stop.clear()
-    
     def _publish_json(self, entry):
         """Publish a single JSON payload over MQTT and/or write to file."""
         # Write to file if enabled
@@ -577,16 +522,6 @@ class StreamingDepthSegmentation:
             except Exception as exc:
                 print(f"MQTT publish failed: {exc}")
     
-    def _enqueue_json_entry(self, entry):
-        """Queue JSON entry for asynchronous publishing."""
-        if self.json_worker_thread:
-            try:
-                self.json_queue.put(entry)
-            except Exception as exc:
-                print(f"Failed to queue JSON entry: {exc}")
-        else:
-            self._publish_json(entry)
-    
     def _add_json_entry(self, frame_num, timestamp, distances, masks, original_shape):
         """Publish depth distances entry via MQTT and/or write to file."""
         if not self.mqtt_active and not self.json_file_handle:
@@ -606,22 +541,13 @@ class StreamingDepthSegmentation:
         if depth_matrix is not None:
             entry['depth_matrix'] = depth_matrix
         
-        # Resolve latest available masks and detection mappings
-        masks_to_use = masks if masks else (self.last_masks_for_json or {})
-        mappings_to_use = {}
-        if self.enable_object_detection:
-            if self.last_object_mappings:
-                mappings_to_use = self.last_object_mappings
-            elif self.last_object_mappings_for_json:
-                mappings_to_use = self.last_object_mappings_for_json
-        
-        # Filter masks to only include those with object detections (when available)
-        masks_to_send = masks_to_use
-        if self.enable_object_detection and mappings_to_use:
-            masks_to_send = {
-                obj_id: mask for obj_id, mask in masks_to_use.items()
-                if obj_id in mappings_to_use
-            }
+        # Filter masks to only include those with object detections
+        # This ensures segmentation matrix only has segments that map to detected objects
+        masks_to_send = masks
+        if self.enable_object_detection and self.last_object_mappings:
+            # Only include masks that have object mappings (detected objects)
+            masks_to_send = {obj_id: mask for obj_id, mask in masks.items() 
+                           if obj_id in self.last_object_mappings}
         
         # Add segmentation matrix (only for important/detected objects)
         seg_matrix = self._create_segmentation_matrix(masks_to_send, original_shape)
@@ -629,9 +555,9 @@ class StreamingDepthSegmentation:
             entry['segmentation_matrix'] = seg_matrix
         
         # Add object-to-bbox mappings (includes class, confidence, bbox, overlap)
-        if self.enable_object_detection and mappings_to_use:
+        if self.enable_object_detection and self.last_object_mappings:
             entry['object_detections'] = {}
-            for obj_id, mapping in mappings_to_use.items():
+            for obj_id, mapping in self.last_object_mappings.items():
                 entry['object_detections'][f'segment_{obj_id}'] = {
                     'overlap_ratio': mapping['overlap'],
                     'detected_object': {
@@ -642,7 +568,7 @@ class StreamingDepthSegmentation:
                     }
                 }
         
-        self._enqueue_json_entry(entry)
+        self._publish_json(entry)
     
     def _close_json_file(self):
         """Close JSON file and write closing bracket."""
@@ -655,12 +581,6 @@ class StreamingDepthSegmentation:
                 print(f"Error closing JSON file: {exc}")
             finally:
                 self.json_file_handle = None
-    
-    def _shutdown_outputs(self):
-        """Flush JSON queue and shutdown publishing resources."""
-        self._stop_json_worker()
-        self._close_json_file()
-        self._shutdown_mqtt()
     
     def _save_buffered_frames(self):
         """Save buffered frames to disk"""
@@ -679,46 +599,6 @@ class StreamingDepthSegmentation:
         
         print(f"\nSaved {saved_count} frames to: {self.save_frames_dir}/")
     
-    def _log_performance(self, frame_idx, inference_ms=None, detection_ms=None, json_ms=None):
-        """Print a performance log line for diagnostics."""
-        components = []
-        if inference_ms is not None:
-            components.append(f"depth+seg {inference_ms:.1f} ms")
-        if detection_ms is not None:
-            components.append(f"yolo {detection_ms:.1f} ms")
-        if json_ms is not None:
-            components.append(f"json {json_ms:.1f} ms")
-        
-        if not components:
-            return
-        
-        now = time.time()
-        # Throttle to avoid spamming if called multiple times per frame
-        if now - self.last_perf_log_time < 0.1:
-            return
-        self.last_perf_log_time = now
-        
-        print(f"[Perf] frame {frame_idx}: " + " | ".join(components), flush=True)
-    
-    def _compute_mask_signature(self, masks):
-        """Create a lightweight signature to detect mask changes without heavy comparisons."""
-        if not masks:
-            return ()
-        
-        signature = []
-        for obj_id in sorted(masks.keys()):
-            mask = masks[obj_id]
-            if mask is None:
-                signature.append((obj_id, 0))
-                continue
-            if isinstance(mask, torch.Tensor):
-                mask_np = mask.detach().cpu().numpy()
-            else:
-                mask_np = mask
-            # Use rounded sum as a proxy for area (avoids full mask diff)
-            signature.append((obj_id, float(np.sum(mask_np > 0.5))))
-        return tuple(signature)
-    
     def process_frame(self, frame):
         """
         Process single frame with adaptive quality
@@ -734,30 +614,22 @@ class StreamingDepthSegmentation:
         # Store raw frame for object detection
         self.last_raw_frame = frame.copy()
         
-        detection_ms = None
-        inference_ms = None
-        json_ms = None
-        
         # Run object detection every N frames (on raw frame before resizing)
         if self.enable_object_detection and self.object_detector is not None:
             if self.frame_idx % self.object_detect_every_n == 0:
-                det_start = time.time()
                 self.last_detections = self.object_detector.predict(frame)
-                detection_ms = (time.time() - det_start) * 1000.0
         
         # Resize for processing
         frame_small = cv2.resize(frame, self.process_resolution)
         
         # Process depth + segmentation every N frames
         if self.frame_idx % self.process_every_n == 0:
-            infer_start = time.time()
             # Pass detections to use as prompts
             self.last_depth, self.last_masks = self._process_depth_and_segment(
                 frame_small, 
                 detections=self.last_detections if self.enable_object_detection else None,
                 frame_shape=original_shape
             )
-            inference_ms = (time.time() - infer_start) * 1000.0
             
             # When using YOLO prompts, masks directly correspond to detections
             # So we don't need to filter - just build the mapping
@@ -784,28 +656,6 @@ class StreamingDepthSegmentation:
         depth_colored = self.last_depth if self.last_depth is not None else frame_small
         masks = self.last_filtered_masks if self.last_filtered_masks is not None else self.last_masks
         
-        # Detect mask changes for logging
-        current_signature = self._compute_mask_signature(masks)
-        if current_signature != self.last_mask_signature:
-            if masks:
-                mask_info = ", ".join([f"id={obj_id} area={int(area)}" for obj_id, area in current_signature])
-                print(f"[Seg] frame {self.frame_idx}: masks updated → {mask_info}", flush=True)
-            else:
-                print(f"[Seg] frame {self.frame_idx}: masks cleared", flush=True)
-            self.last_mask_signature = current_signature
-        
-        # Cache latest masks and detections for JSON continuity (after masks resolved)
-        if masks:
-            self.last_masks_for_json = {obj_id: mask for obj_id, mask in masks.items()}
-        if self.last_object_mappings:
-            self.last_object_mappings_for_json = {
-                obj_id: {
-                    'overlap': mapping['overlap'],
-                    'detection': dict(mapping['detection']) if mapping.get('detection') else None
-                }
-                for obj_id, mapping in self.last_object_mappings.items()
-            }
-        
         # Apply masks (only filtered masks are drawn)
         if masks:
             output = self.tracker.draw_masks(depth_colored, masks)
@@ -821,23 +671,14 @@ class StreamingDepthSegmentation:
         self.fps_tracker.append(1.0 / (current_time - self.last_time))
         self.last_time = current_time
         
-        # Determine masks to publish (fallback to last good masks for continuity)
-        masks_for_publish = masks if masks else (self.last_masks_for_json or {})
-        
         # Add to JSON at specified interval (use filtered masks)
-        should_publish = (self.mqtt_active or self.json_file_handle) and self.frame_idx % self.json_interval == 0
-        if should_publish:
-            json_start = time.time()
-            distances = self._calculate_segment_distances(masks_for_publish) if masks_for_publish else {}
-            self._add_json_entry(self.frame_idx, current_time, distances, masks_for_publish, original_shape)
-            json_ms = (time.time() - json_start) * 1000.0
+        if (self.mqtt_active or self.json_file_handle) and masks and self.frame_idx % self.json_interval == 0:
+            distances = self._calculate_segment_distances(masks)
+            self._add_json_entry(self.frame_idx, current_time, distances, masks, original_shape)
         
         # Save to frame buffer if enabled
         if self.frame_buffer is not None:
             self.frame_buffer.append((self.frame_idx, output_full.copy()))
-        
-        # Log performance
-        self._log_performance(self.frame_idx, inference_ms=inference_ms, detection_ms=detection_ms, json_ms=json_ms)
         
         # No overlay - just return the masked depth frame
         self.frame_idx += 1
@@ -914,8 +755,10 @@ class StreamingDepthSegmentation:
             # Save buffered frames
             self._save_buffered_frames()
             
-            # Shutdown publishing outputs
-            self._shutdown_outputs()
+            # Close JSON file
+            self._close_json_file()
+            
+            self._shutdown_mqtt()
             
             avg_fps = np.mean(self.fps_tracker) if self.fps_tracker else 0
             print(f"\n✓ Stream ended. Average FPS: {avg_fps:.1f}")
@@ -987,8 +830,10 @@ class StreamingDepthSegmentation:
         # Save buffered frames
         self._save_buffered_frames()
         
-        # Shutdown publishing outputs
-        self._shutdown_outputs()
+        # Close JSON file
+        self._close_json_file()
+        
+        self._shutdown_mqtt()
         
         avg_fps = np.mean(self.fps_tracker) if self.fps_tracker else 0
         print(f"\n✓ RTSP stream ended. Average FPS: {avg_fps:.1f}")
@@ -1072,8 +917,10 @@ class StreamingDepthSegmentation:
             # Save buffered frames
             self._save_buffered_frames()
             
-            # Shutdown publishing outputs
-            self._shutdown_outputs()
+            # Close JSON file
+            self._close_json_file()
+            
+            self._shutdown_mqtt()
             
             avg_fps = np.mean(self.fps_tracker) if self.fps_tracker else 0
             print(f"\n✓ Done! Average FPS: {avg_fps:.1f}")
