@@ -7,6 +7,7 @@ public class MqttTextPresenter : MonoBehaviour
     [SerializeField] private MqttMessageClient mqttClient;
     [SerializeField] private TextMeshProUGUI targetText;
     [SerializeField] private bool showRawPayload = true;
+    [SerializeField] private bool showDecodedSummary = true;
     [SerializeField] private int maxPayloadCharacters = 500;
 
     private readonly StringBuilder _builder = new StringBuilder(1024);
@@ -66,6 +67,21 @@ public class MqttTextPresenter : MonoBehaviour
         if (string.IsNullOrEmpty(payload))
         {
             _builder.AppendLine("Waiting for MQTT payload...");
+        }
+
+        if (showDecodedSummary && MqttPayloadDecoder.TryDecode(payload, out var decoded))
+        {
+            _builder.AppendLine($"Frame: {decoded.Frame}");
+            _builder.AppendLine($"Timestamp: {decoded.Timestamp:F3}");
+            if (decoded.MatrixResolution != null)
+            {
+                _builder.AppendLine($"Resolution: {decoded.MatrixResolution.Width} x {decoded.MatrixResolution.Height}");
+            }
+
+            int depthRows = decoded.DepthMatrix?.Count ?? 0;
+            int segRows = decoded.SegmentationMatrix?.Count ?? 0;
+            _builder.AppendLine($"Depth rows: {depthRows}");
+            _builder.AppendLine($"Segmentation rows: {segRows}");
         }
 
         if (showRawPayload && !string.IsNullOrEmpty(payload))
